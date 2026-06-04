@@ -12,7 +12,7 @@
 # ============================================================
 # IMPORT LIBRARIES
 # ============================================================
-
+print("Script started")
 import os
 import logging
 import requests
@@ -33,27 +33,38 @@ from sklearn.metrics import r2_score
 
 import joblib
 
+
 # ============================================================
-# LOAD ENVIRONMENT VARIABLES
+# LOAD ENVIRONMENT VARIABLES + SUPABASE CONNECTION
 # ============================================================
+
+from urllib.parse import quote_plus
 
 load_dotenv()
 
 API_KEY = os.getenv("ALPHA_VANTAGE_API_KEY")
 
-DATABASE_URI = os.getenv("DATABASE_URL")
+SUPABASE_DB_PASSWORD = os.getenv("SUPABASE_DB_PASSWORD")
 
-if not DATABASE_URI:
-    raise ValueError(
-        "DATABASE_URL not found in .env file"
-    )
+if not SUPABASE_DB_PASSWORD:
+    raise ValueError("SUPABASE_DB_PASSWORD missing in .env")
+
+SUPABASE_DB_PASSWORD = quote_plus(SUPABASE_DB_PASSWORD)
+
+DATABASE_URI = (
+    "postgresql+psycopg2://postgres.wqimjjhddlgjvonmssrd:"
+    f"{SUPABASE_DB_PASSWORD}"
+    "@aws-1-us-west-1.pooler.supabase.com:6543/postgres"
+)
+
+print("DATABASE URI LOADED")
+print("HOST: aws-1-us-west-1.pooler.supabase.com")
 
 engine = create_engine(
     DATABASE_URI,
     pool_pre_ping=True,
     pool_recycle=300
 )
-
 # ============================================================
 # LOGGING CONFIGURATION
 # ============================================================
@@ -176,7 +187,9 @@ def create_tables():
 
             macd_indicator NUMERIC(10,4),
 
-            etl_load_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            etl_load_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        
+            CONSTRAINT unique_stock_day
             
             UNIQUE(company_id, trading_date)
         );
@@ -305,6 +318,7 @@ def load_company_dimension():
 # ============================================================
 
 # ============================================================
+# ============================================================
 # API EXTRACTION WITH RETRY LOGIC
 # ============================================================
 
@@ -313,14 +327,9 @@ def extract_stock_data(symbol):
     logging.info(f"Extracting data for {symbol}")
 
     params = {
-
-        "function": "TIME_SERIES_DAILY_ADJUSTED",
-
+        "function": "TIME_SERIES_DAILY",
         "symbol": symbol,
-
         "apikey": API_KEY,
-
-        # compact = latest ~100 trading days
         "outputsize": "compact"
     }
 
@@ -340,34 +349,31 @@ def extract_stock_data(symbol):
 
             data = response.json()
 
-            # API limit reached
-            if "Note" in data:
+            print(f"\nAlpha Vantage response keys for {symbol}: {list(data.keys())}\n")
 
+            if "Note" in data:
                 logging.warning(
                     "Alpha Vantage rate limit reached. Waiting 60 seconds..."
                 )
-
                 time.sleep(60)
-
                 continue
 
-            # Invalid symbol or API error
-            if "Error Message" in data:
+            if "Information" in data:
+                raise Exception(
+                    f"Alpha Vantage returned information message: {data['Information']}"
+                )
 
+            if "Error Message" in data:
                 raise Exception(
                     f"API Error: {data['Error Message']}"
                 )
 
-            # Missing expected data
             if "Time Series (Daily)" not in data:
-
                 raise Exception(
-                    "Time Series data not found in API response"
+                    f"Time Series data not found. Response keys: {list(data.keys())}"
                 )
 
-            logging.info(
-                f"Successfully extracted {symbol}"
-            )
+            logging.info(f"Successfully extracted {symbol}")
 
             return data
 
@@ -378,11 +384,7 @@ def extract_stock_data(symbol):
             )
 
             if attempt < max_retries - 1:
-
-                logging.info(
-                    "Retrying in 5 seconds..."
-                )
-
+                logging.info("Retrying in 5 seconds...")
                 time.sleep(5)
 
     raise Exception(
@@ -438,9 +440,7 @@ def transform_stock_data(symbol, raw_data):
     logging.info(f"Transforming data for {symbol}")
 
     if "Time Series (Daily)" not in raw_data:
-
         logging.error("Invalid API response")
-
         return pd.DataFrame()
 
     df = pd.DataFrame(
@@ -449,21 +449,22 @@ def transform_stock_data(symbol, raw_data):
 
     df.reset_index(inplace=True)
 
+    # TIME_SERIES_DAILY returns:
+    # date, open, high, low, close, volume
     df.columns = [
-
         "trading_date",
         "open_price",
         "high_price",
         "low_price",
         "close_price",
-        "adjusted_close",
-        "volume",
-        "dividend_amount",
-        "split_coefficient"
+        "volume"
     ]
 
-    numeric_columns = [
+    # Since this endpoint does not provide adjusted close,
+    # we use close_price as adjusted_close for schema compatibility.
+    df["adjusted_close"] = df["close_price"]
 
+    numeric_columns = [
         "open_price",
         "high_price",
         "low_price",
@@ -483,13 +484,43 @@ def transform_stock_data(symbol, raw_data):
 
     df["stock_symbol"] = symbol
 
-    # --------------------------------------------------------
-    # CLEANING
-    # --------------------------------------------------------
-
     df = df.dropna()
-
     df = df.drop_duplicates()
+
+    df["daily_return_pct"] = (
+        (
+            df["close_price"]
+            - df["open_price"]
+        )
+        / df["open_price"]
+    ) * 100
+
+    df["moving_avg_7"] = (
+        df["close_price"]
+        .rolling(window=7)
+        .mean()
+    )
+
+    df["moving_avg_30"] = (
+        df["close_price"]
+        .rolling(window=30)
+        .mean()
+    )
+
+    df["volatility_score"] = (
+        df["high_price"]
+        - df["low_price"]
+    )
+
+    df["rsi_indicator"] = calculate_rsi(
+        df["close_price"]
+    )
+
+    df["macd_indicator"] = calculate_macd(
+        df["close_price"]
+    )
+
+    return df
 
     # --------------------------------------------------------
     # FEATURE ENGINEERING
@@ -591,6 +622,14 @@ def incremental_load(df):
     FROM fact_stock_prices
 
     """, engine)
+    
+    if not existing_data.empty:
+
+        existing_data["trading_date"] = (
+            pd.to_datetime(
+                existing_data["trading_date"]
+            ).dt.date
+        )
 
     company_lookup = pd.read_sql(
 
@@ -624,18 +663,26 @@ def incremental_load(df):
         "volatility_score",
         "rsi_indicator",
         "macd_indicator"
-    ]]
+    ]].copy()
 
+    fact_df["trading_date"] = (
+        pd.to_datetime(
+            fact_df["trading_date"]
+        ).dt.date
+    )
+
+    
+    print("FACT TYPE:", fact_df["trading_date"].dtype)
+
+    print("EXISTING TYPE:", existing_data["trading_date"].dtype)
+    
     merged_existing = fact_df.merge(
-
         existing_data,
-
         on=["company_id", "trading_date"],
-
         how="left",
-
         indicator=True
     )
+
 
     new_records = merged_existing[
         merged_existing["_merge"] == "left_only"
@@ -687,24 +734,15 @@ def train_prediction_model():
         volatility_score,
         rsi_indicator,
         macd_indicator
-
     FROM fact_stock_prices
 
     """
 
     df = pd.read_sql(query, engine)
 
-    # --------------------------------------------------------
-    # SORT DATA
-    # --------------------------------------------------------
-
     df = df.sort_values(
         by=["company_id", "trading_date"]
     )
-
-    # --------------------------------------------------------
-    # TARGET VARIABLE
-    # --------------------------------------------------------
 
     df["target_close_price"] = (
         df.groupby("company_id")["close_price"]
@@ -713,12 +751,7 @@ def train_prediction_model():
 
     df = df.dropna()
 
-    # --------------------------------------------------------
-    # FEATURES
-    # --------------------------------------------------------
-
     X = df[[
-
         "volume",
         "daily_return_pct",
         "moving_avg_7",
@@ -730,28 +763,15 @@ def train_prediction_model():
 
     y = df["target_close_price"]
 
-    # --------------------------------------------------------
-    # TRAIN TEST SPLIT
-    # --------------------------------------------------------
-
     X_train, X_test, y_train, y_test = train_test_split(
-
         X,
         y,
-
         test_size=0.2,
-
         random_state=120226
     )
 
-    # --------------------------------------------------------
-    # RANDOM FOREST MODEL
-    # --------------------------------------------------------
-
     model = RandomForestRegressor(
-
         n_estimators=100,
-
         random_state=120226
     )
 
@@ -759,59 +779,34 @@ def train_prediction_model():
 
     predictions = model.predict(X_test)
 
-    # --------------------------------------------------------
-    # MODEL EVALUATION
-    # --------------------------------------------------------
-
-    mae = mean_absolute_error(
-        y_test,
-        predictions
-    )
+    mae = mean_absolute_error(y_test, predictions)
 
     rmse = np.sqrt(
-        mean_squared_error(
-            y_test,
-            predictions
-        )
+        mean_squared_error(y_test, predictions)
     )
 
-    r2 = r2_score(
-        y_test,
-        predictions
-    )
+    r2 = r2_score(y_test, predictions)
 
     logging.info(f"MAE: {mae}")
-
     logging.info(f"RMSE: {rmse}")
-
     logging.info(f"R2 Score: {r2}")
 
-    # --------------------------------------------------------
-    # SAVE MODEL
-    # --------------------------------------------------------
-
     joblib.dump(
-
         model,
-
         "stock_prediction_model.pkl"
     )
 
     logging.info("Model saved successfully")
 
-    # --------------------------------------------------------
-    # STORE PREDICTIONS
-    # --------------------------------------------------------
-
     prediction_df = pd.DataFrame({
 
-        "company_id": df.iloc[X_test.index]["company_id"],
+        "company_id": df.loc[X_test.index, "company_id"].values,
 
-        "prediction_date": df.iloc[X_test.index]["trading_date"],
+        "prediction_date": df.loc[X_test.index, "trading_date"].values,
 
         "predicted_close_price": predictions,
 
-        "actual_close_price": y_test,
+        "actual_close_price": y_test.values,
 
         "model_name": "RandomForestRegressor",
 
@@ -819,117 +814,25 @@ def train_prediction_model():
     })
 
     prediction_df = prediction_df.drop_duplicates()
-    
+
     try:
-        
+
         prediction_df.to_sql(
-
-        "stock_predictions",
-
-        engine,
-
-        if_exists="append",
-
-        index=False
+            "stock_predictions",
+            engine,
+            if_exists="append",
+            index=False
         )
-    
-  
+
+        logging.info("Predictions saved successfully")
+
     except Exception as e:
+
         logging.warning(
             f"Error occurred while saving predictions: {e}"
         )
-
-    # --------------------------------------------------------
-    # EXPORT POWER BI DATASETS
-    # --------------------------------------------------------
-
-    export_powerbi_datasets()
-
-# ============================================================
-# POWER BI EXPORTS
-# ============================================================
-
-def export_powerbi_datasets():
-
-    logging.info(
-        "Exporting Power BI datasets"
-    )
-
-    # --------------------------------------------------------
-    # HISTORICAL STOCK DATA
-    # --------------------------------------------------------
-
-    stock_query = """
-
-    SELECT
-        d.stock_symbol,
-        f.trading_date,
-        f.close_price,
-        f.volume,
-        f.daily_return_pct,
-        f.moving_avg_7,
-        f.moving_avg_30,
-        f.volatility_score,
-        f.rsi_indicator,
-        f.macd_indicator
-
-    FROM fact_stock_prices f
-
-    JOIN dim_company d
-    ON f.company_id = d.company_id
-
-    """
-
-    stock_df = pd.read_sql(
-        stock_query,
-        engine
-    )
-
-    stock_df.to_csv(
-
-        "powerbi_stock_dataset.csv",
-
-        index=False
-    )
-
-    # --------------------------------------------------------
-    # PREDICTION DATASET
-    # --------------------------------------------------------
-
-    prediction_query = """
-
-    SELECT
-        d.stock_symbol,
-        p.prediction_date,
-        p.predicted_close_price,
-        p.actual_close_price,
-        p.model_accuracy
-
-    FROM stock_predictions p
-
-    JOIN dim_company d
-    ON p.company_id = d.company_id
-
-    """
-
-    prediction_df = pd.read_sql(
-
-        prediction_query,
-
-        engine
-    )
-
-    prediction_df.to_csv(
-
-        "powerbi_prediction_dataset.csv",
-
-        index=False
-    )
-
-    logging.info(
-        "Power BI datasets exported"
-    )
-
+        
+ 
 # ============================================================
 # PIPELINE EXECUTION LOGGING
 # ============================================================
